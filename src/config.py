@@ -1094,6 +1094,7 @@ class Config:
     searxng_base_urls: List[str] = field(default_factory=list)  # SearXNG instance URLs (self-hosted, no quota)
     searxng_public_instances_enabled: bool = False  # Opt in to public discovery when base URLs are absent
     searxng_timeout_seconds: int = 10  # 自建 SearXNG 单次搜索超时（秒）
+    free_news_enabled: bool = True  # 免 Key 新闻兜底：yfinance 个股新闻 + Google News RSS
 
     # === Social Sentiment (US stocks only, api.adanos.org) ===
     social_sentiment_api_key: Optional[str] = None
@@ -1831,6 +1832,11 @@ class Config:
                 "SEARXNG_BASE_URLS 中存在无效 URL，已忽略: %s",
                 ", ".join(invalid_searxng_urls[:3]),
             )
+        # 免 Key 新闻兜底（yfinance 个股新闻 + Google News RSS），默认开启
+        free_news_enabled = parse_env_bool(
+            os.getenv('FREE_NEWS_ENABLED'),
+            default=True,
+        )
         searxng_public_instances_enabled = parse_env_bool(
             os.getenv('SEARXNG_PUBLIC_INSTANCES_ENABLED'),
             default=False,
@@ -2010,6 +2016,7 @@ class Config:
             serpapi_keys=serpapi_keys,
             searxng_base_urls=searxng_base_urls,
             searxng_public_instances_enabled=searxng_public_instances_enabled,
+            free_news_enabled=free_news_enabled,
             searxng_timeout_seconds=parse_env_int(
                 os.getenv('SEARXNG_TIMEOUT_SECONDS'), 10, field_name='SEARXNG_TIMEOUT_SECONDS', minimum=1
             ),
@@ -3180,6 +3187,7 @@ class Config:
             or self.brave_api_keys
             or self.serpapi_keys
             or self.has_searxng_enabled()
+            or bool(getattr(self, 'free_news_enabled', False))
         )
 
     def is_agent_available(self) -> bool:

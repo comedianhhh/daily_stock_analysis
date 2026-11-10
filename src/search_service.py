@@ -2241,6 +2241,222 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_US_TICKER_RE = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace (stdlib only)."""
+    import html as _html
+
+    cleaned = _HTML_TAG_RE.sub(" ", text or "")
+    return re.sub(r"\s+", " ", _html.unescape(cleaned)).strip()
+
+
+class _KeylessSearchProvider(BaseSearchProvider):
+    """Base for providers that need no API key.
+
+    Bypasses the key rotation in ``_execute_search`` while keeping the same
+    timing, ``mark_retrieved`` and error-to-response conversion contract.
+    """
+
+    def __init__(self, name: str, *, enabled: bool = True, timeout_seconds: int = 10):
+        super().__init__([], name)
+        self._enabled = bool(enabled)
+        self._timeout_seconds = max(1, int(timeout_seconds))
+
+    @property
+    def is_available(self) -> bool:
+        return self._enabled
+
+    def _do_search(self, query: str, api_key: str, max_results: int, days: int = 7) -> SearchResponse:
+        raise NotImplementedError  # keyless providers implement _fetch instead
+
+    @abstractmethod
+    def _fetch(self, query: str, max_results: int, days: int, **kwargs: Any) -> SearchResponse:
+        """Run the provider request (subclasses implement)."""
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs: Any) -> SearchResponse:  # type: ignore[override]
+        start_time = time.time()
+        try:
+            response = self._fetch(query, max_results, days, **kwargs)
+        except Exception as exc:
+            logger.warning("[%s] 搜索 '%s' 失败: %s", self._name, query, exc)
+            response = SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+        response.search_time = time.time() - start_time
+        if response.success:
+            response.mark_retrieved()
+            logger.info(
+                "[%s] 搜索 '%s' 成功，返回 %s 条结果，耗时 %.2fs",
+                self._name, query, len(response.results), response.search_time,
+            )
+        return response
+
+
+class YFinanceNewsProvider(_KeylessSearchProvider):
+    """Ticker-scoped news from Yahoo Finance via ``yfinance.Ticker.news``.
+
+    - No API key; yfinance is already a DSA data dependency.
+    - Only handles US-style tickers passed as ``stock_code``. Free-text
+      queries (topic / market searches) return an unsuccessful response so
+      the service falls through to the next provider.
+    """
+
+    def __init__(self, *, enabled: bool = True, timeout_seconds: int = 10, ticker_factory: Any = None):
+        super().__init__("YFinanceNews", enabled=enabled, timeout_seconds=timeout_seconds)
+        self._ticker_factory = ticker_factory
+
+    @staticmethod
+    def normalize_ticker(stock_code: Optional[str]) -> Optional[str]:
+        code = (stock_code or "").strip().upper()
+        if code.startswith("US."):
+            code = code[3:]
+        return code if _US_TICKER_RE.match(code) else None
+
+    def _get_ticker(self, symbol: str) -> Any:
+        if self._ticker_factory is not None:
+            return self._ticker_factory(symbol)
+        import yfinance as yf  # lazy: keep module import cheap
+
+        return yf.Ticker(symbol)
+
+    @staticmethod
+    def _parse_item(item: Dict[str, Any]) -> Optional[SearchResult]:
+        """Handle both the current (``content``-wrapped) and legacy yfinance shapes."""
+        content = item.get("content") if isinstance(item.get("content"), dict) else item
+        title = (content.get("title") or "").strip()
+        if not title:
+            return None
+        url = ""
+        for key in ("canonicalUrl", "clickThroughUrl"):
+            link = content.get(key)
+            if isinstance(link, dict) and link.get("url"):
+                url = link["url"]
+                break
+        url = url or content.get("link") or ""
+        provider = content.get("provider")
+        source = (
+            provider.get("displayName") if isinstance(provider, dict) else None
+        ) or content.get("publisher") or "Yahoo Finance"
+        published = content.get("pubDate") or content.get("displayTime")
+        if not published and content.get("providerPublishTime"):
+            published = str(int(content["providerPublishTime"]))
+        snippet = _strip_html(content.get("summary") or content.get("description") or "")[:500]
+        return SearchResult(
+            title=title,
+            snippet=snippet or title,
+            url=url,
+            source=source,
+            published_date=published,
+        )
+
+    def _fetch(self, query: str, max_results: int, days: int, **kwargs: Any) -> SearchResponse:
+        symbol = self.normalize_ticker(kwargs.get("stock_code"))
+        if not symbol:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message="YFinanceNews 仅支持美股代码检索",
+            )
+        raw_items = self._get_ticker(symbol).news or []
+        results: List[SearchResult] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._parse_item(item)
+            if parsed is not None:
+                results.append(parsed)
+            if len(results) >= max_results:
+                break
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self._name,
+            success=bool(results),
+            error_message=None if results else f"YFinanceNews 未返回 {symbol} 的新闻",
+        )
+
+
+class GoogleNewsRSSProvider(_KeylessSearchProvider):
+    """Google News search RSS feed (no API key, free-text queries).
+
+    Uses the ``when:Nd`` operator for recency. The RSS endpoint is far more
+    tolerant of automated access than the HTML site, but heavy use can still
+    be rate limited, so it sits last in the provider chain.
+    """
+
+    RSS_URL = "https://news.google.com/rss/search"
+
+    def __init__(self, *, enabled: bool = True, timeout_seconds: int = 10, http_get: Any = None):
+        super().__init__("GoogleNewsRSS", enabled=enabled, timeout_seconds=timeout_seconds)
+        self._http_get = http_get
+
+    @staticmethod
+    def build_params(query: str, days: int, *, prefer_chinese: bool = False) -> Dict[str, str]:
+        q = f"{query} when:{max(1, int(days))}d"
+        if prefer_chinese:
+            return {"q": q, "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"}
+        return {"q": q, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+
+    @staticmethod
+    def parse_feed(xml_text: str, max_results: int) -> List[SearchResult]:
+        import xml.etree.ElementTree as ET
+
+        root = ET.fromstring(xml_text)
+        results: List[SearchResult] = []
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+            if not title:
+                continue
+            source = (item.findtext("source") or "").strip()
+            # Google appends " - <Source>" to every headline.
+            if source and title.endswith(f" - {source}"):
+                title = title[: -len(source) - 3].rstrip()
+            snippet = _strip_html(item.findtext("description") or "")
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=(snippet or title)[:500],
+                    url=(item.findtext("link") or "").strip(),
+                    source=source or "Google News",
+                    published_date=(item.findtext("pubDate") or "").strip() or None,
+                )
+            )
+            if len(results) >= max_results:
+                break
+        return results
+
+    def _fetch(self, query: str, max_results: int, days: int, **kwargs: Any) -> SearchResponse:
+        params = self.build_params(query, days, prefer_chinese=bool(kwargs.get("prefer_chinese")))
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; daily-stock-analysis news reader)"}
+        getter = self._http_get or _get_with_retry
+        resp = getter(self.RSS_URL, headers=headers, params=params, timeout=self._timeout_seconds)
+        if resp.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self._name,
+                success=False,
+                error_message=f"HTTP {resp.status_code}",
+            )
+        results = self.parse_feed(resp.text, max_results)
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self._name,
+            success=bool(results),
+            error_message=None if results else "Google News RSS 无结果",
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2414,6 +2630,7 @@ class SearchService:
         searxng_timeout_seconds: Optional[int] = None,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
+        free_news_enabled: bool = False,
     ):
         """
         初始化搜索服务
@@ -2440,6 +2657,7 @@ class SearchService:
             "searxng_base_urls": list(searxng_base_urls or []),
             "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
             "searxng_timeout_seconds": searxng_timeout_seconds,
+            "free_news_enabled": bool(free_news_enabled),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
         }
@@ -2504,6 +2722,12 @@ class SearchService:
                 logger.info("已配置 SearXNG 搜索，共 %s 个自建实例", len(searxng_base_urls))
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
+
+        # 8. 免 Key 新闻源（兜底）：yfinance 个股新闻（仅美股代码）+ Google News RSS
+        if free_news_enabled:
+            self._providers.append(YFinanceNewsProvider())
+            self._providers.append(GoogleNewsRSSProvider())
+            logger.info("已启用免 Key 新闻源：YFinanceNews（美股）、GoogleNewsRSS")
 
         if not self._providers:
             logger.warning("未配置任何搜索能力，新闻搜索功能将不可用")
@@ -3900,6 +4124,10 @@ class SearchService:
                     search_kwargs["topic"] = "news"
                 elif isinstance(provider, BraveSearchProvider):
                     search_kwargs.update(self._brave_search_locale("", prefer_chinese=prefer_chinese))
+                elif isinstance(provider, YFinanceNewsProvider):
+                    continue  # topic queries have no ticker
+                elif isinstance(provider, GoogleNewsRSSProvider):
+                    search_kwargs["prefer_chinese"] = prefer_chinese
 
                 started_at = time.monotonic()
                 try:
@@ -4147,6 +4375,12 @@ class SearchService:
                             prefer_chinese=prefer_chinese,
                         )
                     )
+                elif isinstance(provider, YFinanceNewsProvider):
+                    if focus_keywords:
+                        continue  # ticker feed cannot honor custom keyword queries
+                    search_kwargs["stock_code"] = stock_code
+                elif isinstance(provider, GoogleNewsRSSProvider):
+                    search_kwargs["prefer_chinese"] = prefer_chinese
 
                 started_at = time.monotonic()
                 try:
@@ -4548,10 +4782,18 @@ class SearchService:
                 break
             
             # 选择搜索引擎（轮流使用）
-            available_providers = [p for p in self._providers if p.is_available]
+            # YFinanceNews 只能按代码取个股新闻：仅参与 latest_news 维度，且需是美股代码
+            yf_applicable = (
+                dim['name'] == 'latest_news'
+                and YFinanceNewsProvider.normalize_ticker(stock_code) is not None
+            )
+            available_providers = [
+                p for p in self._providers
+                if p.is_available and (yf_applicable or not isinstance(p, YFinanceNewsProvider))
+            ]
             if not available_providers:
                 break
-            
+
             provider = available_providers[provider_index % len(available_providers)]
             provider_index += 1
             
@@ -4574,6 +4816,15 @@ class SearchService:
                     max_results=provider_max_results,
                     days=request_days,
                     topic=dim['tavily_topic'],
+                )
+            elif isinstance(provider, _KeylessSearchProvider):
+                response = self._search_keyless_with_fallback(
+                    provider,
+                    [p for p in available_providers if isinstance(p, _KeylessSearchProvider)],
+                    dim['query'],
+                    max_results=provider_max_results,
+                    days=request_days,
+                    stock_code=stock_code,
                 )
             else:
                 response = provider.search(
@@ -4635,6 +4886,32 @@ class SearchService:
         
         return results
     
+    @staticmethod
+    def _search_keyless_with_fallback(
+        first: "_KeylessSearchProvider",
+        keyless_pool: List["_KeylessSearchProvider"],
+        query: str,
+        *,
+        max_results: int,
+        days: int,
+        stock_code: str,
+    ) -> SearchResponse:
+        """Try ``first`` then the other keyless providers until one returns results.
+
+        Keyless sources are free, so a cheap second attempt is worth it; paid
+        providers keep the original single-attempt rotation.
+        """
+        ordered = [first] + [p for p in keyless_pool if p is not first]
+        response: Optional[SearchResponse] = None
+        for candidate in ordered:
+            kwargs: Dict[str, Any] = {}
+            if isinstance(candidate, YFinanceNewsProvider):
+                kwargs["stock_code"] = stock_code
+            response = candidate.search(query, max_results=max_results, days=days, **kwargs)
+            if response.success and response.results:
+                return response
+        return response  # type: ignore[return-value]
+
     def format_intel_report(self, intel_results: Dict[str, SearchResponse], stock_name: str) -> str:
         """
         格式化情报搜索结果为报告
@@ -4927,6 +5204,7 @@ def get_search_service() -> SearchService:
                     searxng_timeout_seconds=getattr(config, "searxng_timeout_seconds", None),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
+                    free_news_enabled=bool(getattr(config, "free_news_enabled", False)),
                 )
     
     return _search_service
